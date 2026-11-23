@@ -1,0 +1,42 @@
+# Generated builds and preview images
+/dist/
+/build/
+/.ufbt/
+/.fbt/
+*.o
+*.a
+*.elf
+*.fap
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local credentials, private keys, and machine-specific environment
+.env
+.env.*
+!.env.example
+.aws/
+.ssh/
+.gnupg/
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+
+# Runtime recordings and logs
+/apps_data/
+/sessions/
+/logs/
+*.log

@@ -1,0 +1,13 @@
+App(
+    appid="feberis_pro",
+    name="Feberis Pro",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="feberis_app",
+    requires=["gui", "storage", "expansion"],
+    stack_size=4096,
+    fap_category="GPIO",
+    fap_version=(0, 3),
+    fap_description="Feberis Pro wardriving controller (FBR1 revision 2)",
+    fap_author="Feberis",
+    sources=["feberis.c", "protocol.c", "ui_model.c", "dashboard.c"],
+)
