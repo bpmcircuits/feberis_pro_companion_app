@@ -10,10 +10,12 @@ typedef enum {
     ScreenDashboard,
     ScreenMenu,
     ScreenSettings,
+    ScreenScanDiagnostics,
     ScreenAps,
     ScreenSessions,
     ScreenText,
     ScreenExit,
+    ScreenStartNoGps,
     ScreenCount
 } Screen;
 typedef enum {
@@ -24,9 +26,13 @@ typedef enum {
     EventCsv,
     EventSettings,
     EventHelp,
+    EventScanDiagnostics,
+    EventScanMetrics,
     EventExit,
     EventExitCancel,
     EventExitConfirm,
+    EventStartNoGpsConfirm,
+    EventStartNoGpsCancel,
     EventSession,
     EventGps,
     EventMemory,
@@ -41,8 +47,8 @@ typedef enum {
     EventConfig = 5000,
     EventSelectSession = 6000,
     EventSetBand = 100,
-    EventSetInterval = 200,
-    EventSetPort = 300,
+    EventSetCycleGap = 200,
+    EventSetLongGap = 300,
     EventAp = 1000
 } UiEvent;
 typedef struct {
@@ -57,17 +63,19 @@ typedef struct {
     unsigned session_count;
     bool refresh_text, refresh_sessions, refresh_aps, refresh_detail;
     VariableItemList* settings;
+    VariableItemList* scan_diagnostics;
+    VariableItem* long_gap_item;
     VariableItem* band_item;
-    VariableItem* interval_item;
-    VariableItem* port_item;
+    VariableItem* cycle_gap_item;
     Widget* text;
     DialogEx* exit_dialog;
+    DialogEx* start_dialog;
     UiSnapshot snapshot;
     ApView listed[AP_LIMIT];
     unsigned listed_count;
     Screen screen, text_parent;
     UiEvent text_kind;
-    bool request_pending, quitting;
+    bool request_pending, quitting, start_dialog_fix;
     uint32_t request_at;
 } FeberisUi;
 
@@ -81,7 +89,6 @@ static bool ui_snapshot(FeberisUi* ui) {
     ui->snapshot.failed = a->failed;
     ui->snapshot.startup = a->startup;
     ui->snapshot.busy = a->pending != CmdNone;
-    ui->snapshot.port = a->port == FuriHalSerialIdLpuart;
     ui->session_count = a->session_count;
     memcpy(ui->session_names, a->sessions, sizeof(ui->session_names));
     furi_mutex_release(a->mutex);
@@ -121,18 +128,24 @@ static void ui_setting_changed(VariableItem* item) {
         }
     }
     uint32_t base = item == ui->band_item       ? EventSetBand
-                    : item == ui->interval_item ? EventSetInterval
-                                                : EventSetPort;
+                    : item == ui->long_gap_item ? EventSetLongGap
+                                                : EventSetCycleGap;
     view_dispatcher_send_custom_event(ui->dispatcher,
                                       base + variable_item_get_current_value_index(item));
 }
 static void ui_setting_enter(void* context, uint32_t index) {
     FeberisUi* ui = context;
+    if(index == 13) view_dispatcher_send_custom_event(ui->dispatcher, EventScanDiagnostics);
     if(index == 14) view_dispatcher_send_custom_event(ui->dispatcher, EventHelp);
+}
+static void ui_scan_diagnostic_enter(void* context, uint32_t index) {
+    FeberisUi* ui = context;
+    if(index == 1) view_dispatcher_send_custom_event(ui->dispatcher, EventScanMetrics);
 }
 static void ui_settings_update(FeberisUi* ui) {
     static const char* const band_text[] = {"Both", "2.4 GHz", "5 GHz"};
-    static const char* const interval_text[] = {"1 s", "2 s", "5 s", "10 s"};
+    static const char* const cycle_text[] = {"Continuous", "50 ms", "100 ms", "250 ms"};
+    static const char* const legacy_text[] = {"1 s", "2 s", "5 s", "10 s"};
     const UiSnapshot* s = &ui->snapshot;
     bool allowed = ui_settings_allowed(s) && !ui->request_pending;
     bool radio_allowed = s->serial_active && s->data.ready && !s->busy && !s->startup &&
@@ -141,16 +154,35 @@ static void ui_settings_update(FeberisUi* ui) {
                          : (s->busy || ui->request_pending || s->startup) ? "Wait..."
                                                                           : "Stop first";
     variable_item_set_values_count(ui->band_item, radio_allowed ? 3 : 1);
-    variable_item_set_values_count(ui->interval_item, allowed ? 4 : 1);
-    variable_item_set_values_count(ui->port_item, !s->serial_active ? 2 : 1);
+    variable_item_set_values_count(ui->cycle_gap_item, allowed ? 4 : 1);
     variable_item_set_current_value_index(ui->band_item, radio_allowed ? s->data.band : 0);
-    variable_item_set_current_value_index(ui->interval_item, allowed ? s->data.interval : 0);
-    variable_item_set_current_value_index(ui->port_item, !s->serial_active ? s->port : 0);
+    unsigned gap = ui_effective_cycle_gap(&s->data), gap_index = 0;
+    bool preset = false;
+    for(unsigned i = 0; i < UI_CYCLE_GAP_COUNT; ++i)
+        if(gap == ui_cycle_gap_preset(s->data.firmware, i)) {
+            gap_index = i;
+            preset = true;
+        }
+    variable_item_set_current_value_index(ui->cycle_gap_item, allowed ? gap_index : 0);
     variable_item_set_current_value_text(
         ui->band_item,
         radio_allowed ? band_text[s->data.band] : (s->serial_active ? locked : "Connect first"));
-    variable_item_set_current_value_text(ui->interval_item,
-                                         allowed ? interval_text[s->data.interval] : locked);
+    char custom_gap[24];
+    snprintf(custom_gap, sizeof(custom_gap), "%u ms (diag)", gap);
+    variable_item_set_current_value_text(
+        ui->cycle_gap_item, !allowed                                    ? locked
+                            : !preset                                   ? custom_gap
+                            : ui_continuous_supported(s->data.firmware) ? cycle_text[gap_index]
+                                                                        : legacy_text[gap_index]);
+    static const unsigned long_gaps[] = {0, 1000, 2000, 5000, 10000, 60000};
+    unsigned long_index = 0;
+    for(unsigned i = 0; i < COUNT_OF(long_gaps); ++i)
+        if(gap == long_gaps[i]) long_index = i;
+    variable_item_set_values_count(ui->long_gap_item, allowed ? COUNT_OF(long_gaps) : 1);
+    variable_item_set_current_value_index(ui->long_gap_item, allowed ? long_index : 0);
+    char long_text[24];
+    snprintf(long_text, sizeof(long_text), "%u ms", gap);
+    variable_item_set_current_value_text(ui->long_gap_item, allowed ? long_text : locked);
     static const char* const modes[] = {"SMART", "FULL", "UNIQUE"};
     for(unsigned i = 1; i < 13; ++i) {
         if(i == 2) continue;
@@ -171,9 +203,6 @@ static void ui_settings_update(FeberisUi* ui) {
                   : i == 3 ? (s->data.config[3] ? "ON (probe)" : "OFF passive")
                            : value);
     }
-    variable_item_set_current_value_text(ui->port_item, s->serial_active ? "In use"
-                                                        : s->port        ? "LPUART"
-                                                                         : "USART");
 }
 static void ui_text_page(FeberisUi* ui, const char* title, const char* body, Screen parent) {
     widget_reset(ui->text);
@@ -187,7 +216,46 @@ static void ui_information(FeberisUi* ui, UiEvent kind) {
     const Model* m = &ui->snapshot.data;
     FuriString* text = furi_string_alloc();
     ui->text_kind = kind;
-    if(kind == EventStatus || kind == EventMemory) {
+    if(kind == EventScanMetrics) {
+        furi_string_printf(text, "Capture: %s\nCycle gap: %u ms\n\n",
+                           m->capture_degraded     ? "degraded / unlocalized"
+                           : m->scan_metrics_known ? "ready"
+                                                   : "unknown",
+                           ui_effective_cycle_gap(m));
+        if(m->scan_metrics_known) {
+            static const char* const labels[FBR_SCAN_METRIC_FIELDS] = {"Boot",
+                                                                       "Session",
+                                                                       "Requested gap ms",
+                                                                       "Dwell ms",
+                                                                       "Capture ready",
+                                                                       "Radio ms",
+                                                                       "Ingest wall ms",
+                                                                       "Actual gap ms",
+                                                                       "Longest gap ms",
+                                                                       "Start period ms",
+                                                                       "Ingest CPU us",
+                                                                       "Captured frames",
+                                                                       "Capture queue drops",
+                                                                       "Malformed frames",
+                                                                       "Capture cache overflows",
+                                                                       "Metadata matched",
+                                                                       "Metadata missing",
+                                                                       "Obs queue high-water",
+                                                                       "Queue pressure ms",
+                                                                       "Scan buffer bytes",
+                                                                       "Capture cache bytes",
+                                                                       "ESP stack free bytes",
+                                                                       "Scan capacity"};
+            for(unsigned i = 0; i < FBR_SCAN_METRIC_FIELDS; ++i)
+                furi_string_cat_printf(text, "%s: %llu\n", labels[i],
+                                       (unsigned long long)m->scan_metrics[i]);
+        } else
+            furi_string_cat(text, "Metrics unavailable\nRequires firmware 0.4.0\n");
+        furi_string_cat(
+            text, "\nCapture drops lose reception metadata; observation drops are separate.\n"
+                  "Continuous adds no delay. Radio sweeps still take seconds.\nReopen to refresh");
+        ui_text_page(ui, "Scan metrics", furi_string_get_cstr(text), ScreenScanDiagnostics);
+    } else if(kind == EventStatus || kind == EventMemory) {
         furi_string_printf(text,
                            "%s\n%s\n\nFirmware: %s / revision 2\nBaud: %lu\nGPS: %s, %lu "
                            "sat\nHDOP: %s\nGPS age: %lu ms\n\n"
@@ -207,6 +275,10 @@ static void ui_information(FeberisUi* ui, UiEvent kind) {
                            (unsigned long)m->queue_capacity,
                            (unsigned long long)(m->elapsed_ms / 1000), (unsigned long)m->truncated,
                            (unsigned long)m->discarded);
+        furi_string_cat_printf(text, "Cycle gap: %u ms\nCapture: %s\n\n", ui_effective_cycle_gap(m),
+                               m->capture_degraded     ? "degraded (RADIO_CAPTURE_INIT)"
+                               : m->scan_metrics_known ? "ready"
+                                                       : "not measured");
         if(m->memory_known) {
             furi_string_cat_printf(text, "PSRAM: %s\nStorage: %s\n",
                                    m->memory[1] ? "initialized" : "unavailable",
@@ -232,11 +304,13 @@ static void ui_information(FeberisUi* ui, UiEvent kind) {
         furi_string_printf(
             text,
             "Fix: %s\nUTC: %s\nLatitude: %s\nLongitude: %s\nAltitude m: %s\nHDOP: %s\nSatellites: "
-            "%s\nAge ms: %s\nSpeed km/h: %s\nCourse deg: %s\nAccuracy m: %s\n\nPosition sampled at "
-            "scan end.\nNot the router location.\nReopen to refresh",
+            "%s\nAge ms: %s\nSpeed km/h: %s\nCourse deg: %s\nAccuracy m: %s\n\nObservation timing\n"
+            "%s\nNot the router location.\nReopen to refresh",
             valid ? "valid" : "invalid", g[1], valid ? g[2] : "-", valid ? g[3] : "-",
-            valid ? g[4] : "-", g[5], g[6], g[7], g[8], g[9],
-            valid && strcmp(g[10], "nan") ? g[10] : "unavailable");
+            valid ? ui_optional_measurement(g[4]) : "-", ui_optional_measurement(g[5]), g[6], g[7],
+            ui_optional_measurement(g[8]), ui_optional_measurement(g[9]),
+            valid && strcmp(g[10], "nan") ? g[10] : "unavailable",
+            ui_observation_timing(m->firmware));
         ui_text_page(ui, "GPS", furi_string_get_cstr(text), ScreenMenu);
     } else if(kind == EventCsv) {
         furi_string_printf(
@@ -253,11 +327,11 @@ static void ui_information(FeberisUi* ui, UiEvent kind) {
         furi_string_set(text, "Feberis Pro UART0\n115200 / 8N1 / 3.3V\n\n"
                               "ESP GPIO11 TX\n  -> Flipper UART RX\nESP GPIO12 RX\n  <- Flipper "
                               "UART TX\nGND <-> GND\n\n"
-                              "Pick USART or LPUART\nin Settings before Connect\nUART stays in use "
+                              "Fixed USART connection\nPress Connect to begin\nUART stays in use "
                               "until\nyou exit this app\n\n"
                               "Power Feberis separately\nNo 5V output is enabled\n\n"
                               "GPS stays on Feberis:\nUART1 at 115200\nGPIO14 RX / GPIO13 TX\n\n"
-                              "No GPS fix?\nAP preview still works\nCSV rows need a valid fix");
+                              "No GPS fix?\nJournal still records\nWiGLE needs valid GPS + UTC");
         ui_text_page(ui, "Connection help", furi_string_get_cstr(text),
                      ui->screen == ScreenSettings ? ScreenSettings : ScreenMenu);
     }
@@ -280,9 +354,13 @@ static void ui_ap_detail(FeberisUi* ui, unsigned index) {
     }
     FuriString* text = furi_string_alloc_printf(
         "%s\n\nBSSID\n%s\n\nSignal: %d dBm\nChannel: %d\nGPS: %s\n\nSecurity\n%s\n\n"
-        "Captured AP snapshot\nBack: return to AP list",
+        "%s\n%s\nCaptured AP snapshot\nBack: return to AP list",
         *ap->ssid ? ap->ssid : "Hidden network", ap->bssid, ap->rssi, ap->channel,
-        ap->fix ? "Valid fix" : "No fix", ap->auth);
+        ap->fix ? "Valid fix" : "No fix", ap->auth,
+        ap->rx_unverified      ? "RX_UNVERIFIED: no position"
+        : ap->reception_timing ? "Verified reception metadata"
+                               : "Legacy scan-end observation",
+        ui_observation_timing(ap->reception_timing ? "0.4.0" : "0.3.1"));
     ui_text_page(ui, "Network details", furi_string_get_cstr(text), ScreenAps);
     furi_string_free(text);
 }
@@ -314,6 +392,25 @@ static void ui_exit_result(DialogExResult result, void* context) {
     view_dispatcher_send_custom_event(
         ui->dispatcher, result == DialogExResultRight ? EventExitConfirm : EventExitCancel);
 }
+static void ui_start_result(DialogExResult result, void* context) {
+    FeberisUi* ui = context;
+    view_dispatcher_send_custom_event(ui->dispatcher, result == DialogExResultRight
+                                                          ? EventStartNoGpsConfirm
+                                                          : EventStartNoGpsCancel);
+}
+static void ui_start_without_gps(FeberisUi* ui) {
+    ui->start_dialog_fix = ui->snapshot.data.fix;
+    dialog_ex_set_header(ui->start_dialog,
+                         ui->start_dialog_fix ? "GPS fix acquired" : "Start without GPS?", 64, 8,
+                         AlignCenter, AlignTop);
+    dialog_ex_set_text(ui->start_dialog,
+                       ui->start_dialog_fix ? "GPS position available.\nStart this session?"
+                                            : "GPS fix unavailable.\nStart without position?",
+                       64, 31, AlignCenter, AlignCenter);
+    dialog_ex_set_left_button_text(ui->start_dialog, "Cancel");
+    dialog_ex_set_right_button_text(ui->start_dialog, "Start");
+    ui_show(ui, ScreenStartNoGps);
+}
 static void ui_finish(FeberisUi* ui) {
     if(ui->quitting) return;
     ActionRequest request = {.type = ActionQuit};
@@ -335,7 +432,7 @@ static void ui_exit_request(FeberisUi* ui) {
 }
 static void ui_show(FeberisUi* ui, Screen screen) {
     ui->screen = screen;
-    if(screen == ScreenSettings) ui_settings_update(ui);
+    if(screen == ScreenSettings || screen == ScreenScanDiagnostics) ui_settings_update(ui);
     if(screen == ScreenDashboard) ui_dashboard_update(ui);
     view_dispatcher_switch_to_view(ui->dispatcher, screen);
 }
@@ -349,6 +446,9 @@ static bool ui_back(void* context) {
     case ScreenMenu:
         ui_show(ui, ScreenDashboard);
         break;
+    case ScreenScanDiagnostics:
+        ui_show(ui, ScreenSettings);
+        break;
     case ScreenSettings:
     case ScreenAps:
     case ScreenSessions:
@@ -356,6 +456,10 @@ static bool ui_back(void* context) {
         break;
     case ScreenText:
         ui_show(ui, ui->text_parent);
+        break;
+    case ScreenStartNoGps:
+        ui_send(ui, ActionCancelStart, 0);
+        ui_show(ui, ScreenDashboard);
         break;
     case ScreenExit:
         ui_show(ui, ScreenDashboard);
@@ -417,6 +521,9 @@ static bool ui_event(void* context, uint32_t event) {
     if(ui->quitting) return true;
     /* Never block the dispatcher or GUI on UART/SD. Leave the last frame visible. */
     ui_snapshot(ui);
+    if(ui->screen == ScreenStartNoGps && event != EventStartNoGpsConfirm &&
+       event != EventStartNoGpsCancel)
+        return true;
     if(event >= EventConfig && event < EventConfig + 39) {
         ui_config_change(ui, (event - EventConfig) / 3, (event - EventConfig) % 3);
     } else if(event >= EventSelectSession && event < EventSelectSession + SESSION_LIMIT) {
@@ -430,19 +537,28 @@ static bool ui_event(void* context, uint32_t event) {
         if(ui->snapshot.data.ready && !ui->snapshot.busy && !ui->snapshot.failed &&
            !ui->request_pending)
             ui_send(ui, ActionBand, event - EventSetBand);
-    } else if(event >= EventSetInterval && event < EventSetInterval + 4) {
+    } else if(event >= EventSetLongGap && event < EventSetLongGap + 6) {
+        static const unsigned gaps[] = {0, 1000, 2000, 5000, 10000, 60000};
         if(ui_settings_allowed(&ui->snapshot) && !ui->request_pending)
-            ui_send(ui, ActionInterval, event - EventSetInterval);
-    } else if(event >= EventSetPort && event < EventSetPort + 2) {
-        App* a = ui->app;
-        if(furi_mutex_acquire(a->mutex, 0) == FuriStatusOk) {
-            if(!a->serial)
-                a->port = event == EventSetPort ? FuriHalSerialIdUsart : FuriHalSerialIdLpuart;
-            furi_mutex_release(a->mutex);
-            ui_snapshot(ui);
-        }
+            ui_send(ui, ActionCycleGap, gaps[event - EventSetLongGap]);
+    } else if(event >= EventSetCycleGap && event < EventSetCycleGap + UI_CYCLE_GAP_COUNT) {
+        if(ui_settings_allowed(&ui->snapshot) && !ui->request_pending)
+            ui_send(ui, ActionCycleGap,
+                    ui_cycle_gap_preset(ui->snapshot.data.firmware, event - EventSetCycleGap));
     } else
         switch(event) {
+        case EventStartNoGpsConfirm:
+            if(ui->screen == ScreenStartNoGps && ui->snapshot.data.start_confirmation_pending) {
+                ui_send(ui, ActionConfirmStart, 0);
+                ui_show(ui, ScreenDashboard);
+            }
+            break;
+        case EventStartNoGpsCancel:
+            if(ui->screen == ScreenStartNoGps) {
+                ui_send(ui, ActionCancelStart, 0);
+                ui_show(ui, ScreenDashboard);
+            }
+            break;
         case EventPrimary: {
             if(ui->request_pending) break;
             UiState state = ui_state(&ui->snapshot);
@@ -471,6 +587,14 @@ static bool ui_event(void* context, uint32_t event) {
             }
             ui_ap_list(ui);
         } break;
+        case EventScanDiagnostics:
+            ui_show(ui, ScreenScanDiagnostics);
+            break;
+        case EventScanMetrics:
+            ui_send(ui, ActionScanMetrics, 0);
+            ui->refresh_text = true;
+            ui_information(ui, event);
+            break;
         case EventSettings:
             ui_show(ui, ScreenSettings);
             break;
@@ -532,6 +656,15 @@ static void ui_tick(void* context) {
         return;
     }
     if(!ui_snapshot(ui)) return;
+    if(!ui->quitting && !ui->request_pending && ui_start_confirmation_needed(&ui->snapshot) &&
+       ui->screen != ScreenStartNoGps)
+        ui_start_without_gps(ui);
+    if(ui->screen == ScreenStartNoGps && !ui->snapshot.data.start_confirmation_pending)
+        ui_show(ui, ScreenDashboard);
+    if(ui->screen == ScreenStartNoGps) {
+        if(ui->start_dialog_fix != ui->snapshot.data.fix) ui_start_without_gps(ui);
+        return;
+    }
     if(ui->refresh_detail && !ui->snapshot.busy && !ui->request_pending) {
         ui->refresh_detail = false;
         if(ui->screen == ScreenText)
@@ -555,7 +688,7 @@ static void ui_tick(void* context) {
         if(ui->screen == ScreenText) ui_information(ui, ui->text_kind);
     }
     if(ui->screen == ScreenDashboard) ui_dashboard_update(ui);
-    if(ui->screen == ScreenSettings) ui_settings_update(ui);
+    if(ui->screen == ScreenSettings || ui->screen == ScreenScanDiagnostics) ui_settings_update(ui);
 }
 static FeberisUi* ui_alloc(App* app, Gui* gui) {
     FeberisUi* ui = calloc(1, sizeof(FeberisUi));
@@ -589,8 +722,8 @@ static FeberisUi* ui_alloc(App* app, Gui* gui) {
     ui->sessions = submenu_alloc();
     ui->settings = variable_item_list_alloc();
     ui->band_item = variable_item_list_add(ui->settings, "Band", 3, ui_setting_changed, ui);
-    ui->interval_item = variable_item_list_add(ui->settings, "Interval", 4, ui_setting_changed, ui);
-    ui->port_item = variable_item_list_add(ui->settings, "UART", 2, ui_setting_changed, ui);
+    ui->cycle_gap_item = variable_item_list_add(ui->settings, "Cycle gap", UI_CYCLE_GAP_COUNT,
+                                                ui_setting_changed, ui);
     static const char* const config_labels[] = {"",
                                                 "Mode",
                                                 "",
@@ -609,19 +742,30 @@ static FeberisUi* ui_alloc(App* app, Gui* gui) {
             ui->config_items[i] = variable_item_list_add(ui->settings, config_labels[i],
                                                          i == 3 ? 2 : 3, ui_setting_changed, ui);
     }
+    variable_item_list_add(ui->settings, "Scan diagnostics", 0, NULL, NULL);
     variable_item_list_add(ui->settings, "Connection help", 0, NULL, NULL);
     variable_item_list_set_enter_callback(ui->settings, ui_setting_enter, ui);
+    ui->scan_diagnostics = variable_item_list_alloc();
+    ui->long_gap_item =
+        variable_item_list_add(ui->scan_diagnostics, "Long cycle gap", 6, ui_setting_changed, ui);
+    variable_item_list_add(ui->scan_diagnostics, "Read metrics", 0, NULL, NULL);
+    variable_item_list_set_enter_callback(ui->scan_diagnostics, ui_scan_diagnostic_enter, ui);
     ui->text = widget_alloc();
+    ui->start_dialog = dialog_ex_alloc();
+    dialog_ex_set_context(ui->start_dialog, ui);
+    dialog_ex_set_result_callback(ui->start_dialog, ui_start_result);
     ui->exit_dialog = dialog_ex_alloc();
     dialog_ex_set_context(ui->exit_dialog, ui);
     dialog_ex_set_result_callback(ui->exit_dialog, ui_exit_result);
     View* views[] = {ui->dashboard,
                      submenu_get_view(ui->menu),
                      variable_item_list_get_view(ui->settings),
+                     variable_item_list_get_view(ui->scan_diagnostics),
                      submenu_get_view(ui->aps),
                      submenu_get_view(ui->sessions),
                      widget_get_view(ui->text),
-                     dialog_ex_get_view(ui->exit_dialog)};
+                     dialog_ex_get_view(ui->exit_dialog),
+                     dialog_ex_get_view(ui->start_dialog)};
     for(unsigned i = 0; i < ScreenCount; ++i) view_dispatcher_add_view(ui->dispatcher, i, views[i]);
     ui_snapshot(ui);
     ui_show(ui, ScreenDashboard);
@@ -635,8 +779,10 @@ static void ui_free(FeberisUi* ui) {
     submenu_free(ui->aps);
     submenu_free(ui->sessions);
     variable_item_list_free(ui->settings);
+    variable_item_list_free(ui->scan_diagnostics);
     widget_free(ui->text);
     dialog_ex_free(ui->exit_dialog);
+    dialog_ex_free(ui->start_dialog);
     view_dispatcher_free(ui->dispatcher);
     free(ui);
 }
@@ -648,13 +794,12 @@ int32_t feberis_app(void* context) {
     a->rx = furi_stream_buffer_alloc(4096, 1);
     a->storage = furi_record_open(RECORD_STORAGE);
     a->file = storage_file_alloc(a->storage);
-    a->port = FuriHalSerialIdUsart;
     a->store.storage = a->storage;
     a->store.file = a->file;
     a->baud = a->model.baud = 115200;
-    a->model.interval = 1;
+    a->model.cycle_gap_ms = 0;
     if(!load_settings(a)) message(a, "Settings invalid; using defaults");
-    message(a, "Choose UART, then Connect");
+    message(a, "Press OK to connect");
     Expansion* expansion = furi_record_open(RECORD_EXPANSION);
     expansion_disable(expansion);
     a->thread = furi_thread_alloc_ex("FeberisWorker", 8192, worker, a);

@@ -4,6 +4,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+const char* const fbr_scan_metric_names[FBR_SCAN_METRIC_FIELDS] = {"boot",
+                                                                   "session",
+                                                                   "requested_gap_ms",
+                                                                   "dwell_ms",
+                                                                   "capture_ready",
+                                                                   "radio_ms",
+                                                                   "ingest_ms",
+                                                                   "gap_ms",
+                                                                   "max_gap_ms",
+                                                                   "period_ms",
+                                                                   "ingest_cpu_us",
+                                                                   "captured",
+                                                                   "dropped",
+                                                                   "malformed",
+                                                                   "cache_overflows",
+                                                                   "metadata_hits",
+                                                                   "metadata_misses",
+                                                                   "queue_high_water",
+                                                                   "backpressure_ms",
+                                                                   "scan_buffer_bytes",
+                                                                   "capture_cache_bytes",
+                                                                   "main_stack_free",
+                                                                   "scan_capacity"};
+
 uint16_t fbr_crc(const char* data, size_t size) {
     uint16_t crc = 0xffff;
     for(size_t i = 0; i < size; ++i) {
@@ -228,9 +252,14 @@ bool fbr_observation(char** f, size_t n, FbrAp* ap) {
        !coordinates(f, 11, 13, 14) || !fbr_utc(f[12]) || !optional(f[15], -100000, 100000) ||
        !optional(f[16], 0, 100000) || !uint_range(f[17], 0, 255) ||
        !uint_range(f[18], 0, UINT32_MAX) || (strcmp(f[20], "2") && strcmp(f[20], "5")) ||
-       !uint_range(f[21], 2300, 6000) || !uint_range(f[22], 1, 127) || !fbr_u64(f[23], &mono) ||
-       !optional(f[24], 0, 10000) || !optional(f[25], 0, 360) || !optional(f[26], 0, 1000000) ||
-       !uint_range(f[27], 0, 63))
+       !uint_range(f[21], 2300, 6000) || !uint_range(f[22], 0, UINT32_MAX) ||
+       !fbr_u64(f[23], &mono) || !optional(f[24], 0, 10000) || !optional(f[25], 0, 360) ||
+       !optional(f[26], 0, 1000000) || !uint_range(f[27], 0, 63))
+        return false;
+    uint32_t reason;
+    fbr_u32(f[22], &reason);
+    if((reason & FBR_RX_UNVERIFIED) &&
+       (strcmp(f[11], "0") || strcmp(f[13], "nan") || strcmp(f[14], "nan") || strcmp(f[19], "-")))
         return false;
     if(strcmp(f[19], "-")) {
         size_t len = strlen(f[19]);
@@ -293,6 +322,20 @@ bool fbr_validate(char** f, size_t n) {
             if(!fbr_u64(f[i], &u)) return false;
         return true;
     }
+    if(!strcmp(f[2], "SCAN_METRICS")) {
+        if(n != 26 || !uint_range(f[3], 0, UINT32_MAX) || !uint_range(f[4], 0, UINT32_MAX) ||
+           !uint_range(f[5], 0, 60000) || !uint_range(f[6], 20, 1500) || !uint_range(f[7], 0, 1) ||
+           !uint_range(f[20], 0, 8192) || !uint_range(f[25], 16, 1024))
+            return false;
+        for(unsigned i = 8; i <= 12; ++i)
+            if(!uint_range(f[i], 0, UINT32_MAX)) return false;
+        for(unsigned i = 13; i <= 19; ++i)
+            if(!fbr_u64(f[i], &u)) return false;
+        if(!fbr_u64(f[21], &u)) return false;
+        for(unsigned i = 22; i <= 24; ++i)
+            if(!uint_range(f[i], 0, UINT32_MAX)) return false;
+        return true;
+    }
     if(!strcmp(f[2], "GPS")) {
         return n == 14 && coordinates(f, 3, 5, 6) && fbr_utc(f[4]) &&
                optional(f[7], -100000, 100000) && optional(f[8], 0, 100000) &&
@@ -341,7 +384,10 @@ static size_t csv_fields(const char** fields, unsigned count, unsigned quoted, c
     return used;
 }
 size_t fbr_wigle(char** f, char* out, size_t cap) {
-    if(strcmp(f[11], "1") || !strcmp(f[12], "-") || strstr(f[8], "UNKNOWN")) return 0;
+    uint32_t reason;
+    if(!fbr_u32(f[22], &reason) || (reason & FBR_RX_UNVERIFIED) || strcmp(f[11], "1") ||
+       !strcmp(f[12], "-") || strstr(f[8], "UNKNOWN"))
+        return 0;
     char ssid[129];
     if(!fbr_ssid(f[7], ssid, sizeof(ssid))) return 0;
     const char* cols[] = {f[6],

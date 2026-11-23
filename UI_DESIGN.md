@@ -16,8 +16,12 @@ counts, and an obvious Start/Stop action. The target is the Flipper's monochrome
   DialogEx exit confirmation, and the custom dashboard.
 - Left opens Menu, OK performs the visible primary action, and Right opens Networks.
   Back follows the navigation hierarchy and confirms exit during an active session.
-- Settings are visible and state-aware. In-use UART selection, configuration
-  transitions, and stopped-session requirements are reflected in the controls.
+- Starting without a GPS fix opens a native Start/Cancel dialog; Back cancels.
+  A fix acquired during the dialog updates its text without starting automatically.
+  The worker checks its current fix before creating a session, so stale GUI state
+  cannot skip the confirmation. Repeated or stale confirmations cannot stop a session.
+- Settings are visible and state-aware. Configuration transitions and stopped-session
+  requirements are reflected in the controls. USART is fixed and has no setting.
 - Network lists are frozen snapshots. A background observation cannot silently
   move the AP under the cursor. Returning from details preserves selection.
 - Full SSID/security strings, file paths, GPS information, and statistics are
@@ -26,11 +30,20 @@ counts, and an obvious Start/Stop action. The target is the Flipper's monochrome
 No decorative animation or desktop-oriented visuals are needed for the LCD.
 Waiting screens describe the operation, such as queue drain or AP archival.
 
-## Revision 2 behavior
+## Revision 2 / application 0.4 behavior
 
 The dashboard displays **Unique AP** from STATS and **SD saved** from synchronized
 journal records, including records without GPS. GPS, diagnostics, and detailed
 session statistics remain separate scrolling pages.
+
+Cycle gap defaults to Continuous (0 ms), with 50/100/250 ms driving presets.
+Settings → Scan diagnostics separates long cycle gaps from driving controls and
+shows measured radio/ingestion/gap/period, capture readiness, capture-metadata
+losses, observation queue pressure, and additional memory buffers. A capture
+initialization failure remains visibly degraded while journaling continues.
+
+Firmware 0.4.0 observation details describe receive-callback/GNSS pairing and
+unverified fallback timestamps; legacy sessions retain scan-end semantics.
 
 The network browser retrieves 24 GET_AP slots per page and fetches full aggregate
 details on demand. Archived sessions are listed 16 directories at a time after

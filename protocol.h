@@ -1,7 +1,9 @@
 #pragma once
+#include "scan_metrics.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#define FBR_RX_UNVERIFIED (1u << 7)
 #define FBR_LINE_SIZE 1536
 #define FBR_FIELDS 48
 

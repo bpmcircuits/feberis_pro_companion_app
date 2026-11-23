@@ -15,8 +15,8 @@ typedef struct {
     bool open, interrupted, complete, damaged;
 } SessionStore;
 static const char wigle_header[] =
-    "WigleWifi-1.4,appRelease=0.3.0,model=Feberis "
-    "Pro,release=0.3.0,device=ESP32-C5,display=Flipper Zero,board=Feberis Pro,brand=Feberis\n"
+    "WigleWifi-1.4,appRelease=0.4.0,model=Feberis "
+    "Pro,release=0.4.0,device=ESP32-C5,display=Flipper Zero,board=Feberis Pro,brand=Sapsan\n"
     "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,"
     "AccuracyMeters,Type\n";
 static const char observation_header[] =
@@ -253,8 +253,9 @@ static bool store_create(SessionStore* s) {
 typedef struct {
     char firmware[16], first_utc[20], last_utc[20], finished_local[20], reason[48];
     uint32_t config[13], ap_capacity, queue_capacity, truncated, discarded;
-    uint64_t stats[21], archive_start;
-    bool stats_known, config_known;
+    uint64_t stats[21], archive_start, rx_unverified;
+    uint64_t scan_metrics[FBR_SCAN_METRIC_FIELDS];
+    bool stats_known, config_known, metrics_known;
 } StoreSummary;
 static bool store_json_string(File* f, const char* text) {
     if(!store_text(f, "\"")) return false;
@@ -291,9 +292,18 @@ static bool store_summary(File* input, StoreReader* r, StoreSummary* m) {
         } else if(!strcmp(f[2], "STATS") && !strcmp(f[3], "0")) {
             for(unsigned i = 0; i < 21; ++i) fbr_u64(f[5 + i], &m->stats[i]);
             m->stats_known = true;
-        } else if(!strcmp(f[2], "OBSERVATION") && strcmp(f[12], "-")) {
-            if(!*m->first_utc) strcpy(m->first_utc, f[12]);
-            strcpy(m->last_utc, f[12]);
+        } else if(!strcmp(f[2], "SCAN_METRICS")) {
+            for(unsigned i = 0; i < FBR_SCAN_METRIC_FIELDS; ++i)
+                fbr_u64(f[i + 3], &m->scan_metrics[i]);
+            m->metrics_known = true;
+        } else if(!strcmp(f[2], "OBSERVATION")) {
+            uint32_t reason;
+            fbr_u32(f[22], &reason);
+            if(reason & FBR_RX_UNVERIFIED) ++m->rx_unverified;
+            if(strcmp(f[12], "-")) {
+                if(!*m->first_utc) strcpy(m->first_utc, f[12]);
+                strcpy(m->last_utc, f[12]);
+            }
         } else if(!strcmp(f[2], "ARCHIVE_BEGIN"))
             m->archive_start = r->end;
         else if(!strcmp(f[2], "FINISH_LOCAL"))
@@ -319,6 +329,18 @@ static bool store_json_stats(File* output, const StoreSummary* m) {
         if(!store_text(output, row)) return false;
     }
     return true;
+}
+static bool store_json_scan_metrics(File* output, const StoreSummary* m) {
+    if(!store_text(output, ",\"scan_metrics\":")) return false;
+    if(!m->metrics_known) return store_text(output, "null");
+    if(!store_text(output, "{")) return false;
+    char row[128];
+    for(unsigned i = 0; i < FBR_SCAN_METRIC_FIELDS; ++i) {
+        snprintf(row, sizeof(row), "%s\"%s\":%llu", i ? "," : "", fbr_scan_metric_names[i],
+                 (unsigned long long)m->scan_metrics[i]);
+        if(!store_text(output, row)) return false;
+    }
+    return store_text(output, "}");
 }
 static bool store_publish(Storage* storage, File* file, const char* tmp, const char* target,
                           uint64_t size) {
@@ -379,19 +401,25 @@ static bool store_export(SessionStore* s) {
                 row, FBR_LINE_SIZE,
                 "{\"schema_version\":1,\"boot\":%lu,\"session\":%lu,\"aggregates_complete\":%s",
                 (unsigned long)s->boot, (unsigned long)s->session, s->complete ? "true" : "false");
-            ok = store_text(output, row) && store_json_stats(output, m);
+            ok = store_text(output, row) && store_json_stats(output, m) &&
+                 store_json_scan_metrics(output, m);
             if(kind == 4) {
                 snprintf(row, FBR_LINE_SIZE,
                          ",\"protocol_revision\":2,\"journal_committed\":%lu,\"journal_records\":%"
                          "llu,\"interrupted\":%s,"
                          "\"ap_capacity\":%lu,\"queue_capacity\":%lu,\"truncated\":%lu,"
                          "\"discarded\":%lu,"
-                         "\"position_timestamp\":\"scan_end\",\"firmware\":",
+                         "\"rx_unverified_observations\":%llu,\"firmware\":",
                          (unsigned long)s->committed, (unsigned long long)s->records,
                          s->interrupted ? "true" : "false", (unsigned long)m->ap_capacity,
                          (unsigned long)m->queue_capacity, (unsigned long)m->truncated,
-                         (unsigned long)m->discarded);
+                         (unsigned long)m->discarded, (unsigned long long)m->rx_unverified);
                 ok = ok && store_text(output, row) && store_json_string(output, m->firmware);
+                ok = ok && store_text(output, ",\"position_timestamp\":") &&
+                     store_json_string(output, !strcmp(m->firmware, "0.4.0")
+                                                   ? "reception_callback_or_scan_end_unverified"
+                                               : *m->firmware ? "scan_end"
+                                                              : "unknown");
                 const char* keys[] = {"local_session_name", "first_observation_utc",
                                       "last_observation_utc", "finished_local", "end_reason"};
                 const char* values[] = {strrchr(s->path, '/') + 1, m->first_utc, m->last_utc,

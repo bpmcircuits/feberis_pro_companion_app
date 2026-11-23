@@ -47,5 +47,40 @@ int main(void) {
     ui_dashboard_snapshot(&s, &compact);
     assert(compact.unique == UINT64_MAX && compact.rows == 123 && compact.state == UiNoMemory);
     assert(sizeof(compact) < 128);
+    assert(!strcmp(ui_optional_measurement("nan"), "unavailable"));
+    assert(!strcmp(ui_optional_measurement(""), "unavailable"));
+    assert(!strcmp(ui_optional_measurement(NULL), "unavailable"));
+    assert(!strcmp(ui_optional_measurement("0.00"), "0.00"));
+    assert(!strcmp(ui_optional_measurement("42.5"), "42.5"));
+    assert(ui_cycle_gap_preset("0.4.0", 0) == 0);
+    assert(ui_cycle_gap_preset("0.4.0", 1) == 50 && ui_cycle_gap_preset("0.4.0", 2) == 100);
+    assert(ui_cycle_gap_preset("0.4.0", 3) == 250);
+    s.data.cycle_gap_ms = 0;
+    strcpy(s.data.firmware, "0.4.0");
+    assert(ui_effective_cycle_gap(&s.data) == 0);
+    strcpy(s.data.firmware, "0.3.1");
+    assert(ui_effective_cycle_gap(&s.data) == 1000);
+    assert(strstr(ui_observation_timing("0.4.0"), "reception callback"));
+    assert(!strcmp(ui_observation_timing("0.3.1"), "Legacy: scan end"));
+    s.data.capture_degraded = true;
+    ui_dashboard_snapshot(&s, &compact);
+    assert(compact.capture_degraded);
+    UiSnapshot start = {0};
+    start.serial_active = start.data.ready = start.data.wifi = start.data.storage_ready =
+        start.data.idle = true;
+    assert(!ui_start_confirmation_needed(&start));
+    start.data.start_confirmation_pending = true;
+    assert(ui_start_confirmation_needed(&start) && !ui_settings_allowed(&start));
+    start.data.fix = true;
+    assert(ui_start_confirmation_needed(
+        &start)); /* Keep the user's decision pending after fix recovery. */
+    start.failed = true;
+    assert(!ui_start_confirmation_needed(&start));
+    start.failed = false;
+    start.data.running = true;
+    assert(!ui_start_confirmation_needed(&start));
+    start.data.running = false;
+    start.data.stopping = true;
+    assert(!ui_start_confirmation_needed(&start));
     puts("ui: state priority, visible actions and setting locks OK");
 }

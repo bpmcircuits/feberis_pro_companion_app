@@ -45,6 +45,11 @@ typedef struct {
 typedef struct {
     unsigned year, month, day, hour, minute, second;
 } DateTime;
+static FuriHalSerialId acquired_port;
+static FuriHalSerialHandle* furi_hal_serial_control_acquire(FuriHalSerialId port) {
+    acquired_port = port;
+    return (FuriHalSerialHandle*)1;
+}
 static uint32_t ticks;
 static char transmissions[1024][272];
 static unsigned tx_count;

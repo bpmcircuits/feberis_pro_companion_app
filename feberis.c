@@ -16,6 +16,7 @@
 #include <string.h>
 #define RX_ERROR (1u << 0)
 #define TIMEOUT_MS 2000
+#define QUERY_RETRIES 2
 
 typedef enum {
     CmdNone,
@@ -36,13 +37,14 @@ typedef enum {
     CmdPause,
     CmdResume,
     CmdGps,
-    CmdApDetail
+    CmdApDetail,
+    CmdScanMetrics
 } Command;
 typedef enum {
     ActionConnect,
     ActionToggle,
     ActionBand,
-    ActionInterval,
+    ActionCycleGap,
     ActionQuit,
     ActionConfig,
     ActionPause,
@@ -54,7 +56,10 @@ typedef enum {
     ActionSelectSession,
     ActionNetworks,
     ActionNetworkDetail,
-    ActionRecoverScan
+    ActionRecoverScan,
+    ActionScanMetrics,
+    ActionConfirmStart,
+    ActionCancelStart
 } Action;
 typedef struct {
     Action type;
@@ -68,7 +73,6 @@ typedef struct {
     FuriStreamBuffer* rx;
     FuriThread* thread;
     FuriHalSerialHandle* serial;
-    FuriHalSerialId port;
     Storage* storage;
     File* file;
     SessionStore store;
@@ -89,7 +93,6 @@ typedef struct {
     volatile bool quiet_rx;
     uint32_t detail_slot, network_next, network_end;
 } App;
-static const unsigned intervals[] = {1000, 2000, 5000, 10000};
 static const uint32_t bauds[] = {115200, 460800, 921600};
 static const char* const bands[] = {"AUTO", "2G", "5G"};
 static uint32_t ms(void) { return furi_get_tick(); }
@@ -127,7 +130,7 @@ static void command(App* a, Command cmd) {
         "",           "STOP_SCAN",   "HELLO",       "STATUS",     "START_SCAN",
         "PING",       "GET_INFO",    "GET_CONFIG",  "GET_MEMORY", "GET_STATUS",
         "GET_STATS",  "GET_AP",      "RESUME_LINK", "NACK",       "SET_CONFIG",
-        "PAUSE_SCAN", "RESUME_SCAN", "GET_GPS",     "GET_AP"};
+        "PAUSE_SCAN", "RESUME_SCAN", "GET_GPS",     "GET_AP",     "GET_SCAN_METRICS"};
     a->pending_id = request_id(a);
     size_t used = snprintf(a->payload, sizeof(a->payload), "FBR1\t%lu\t%s",
                            (unsigned long)a->pending_id, names[cmd]);
@@ -135,7 +138,7 @@ static void command(App* a, Command cmd) {
         snprintf(a->payload + used, sizeof(a->payload) - used, "\t2");
     else if(cmd == CmdStart)
         snprintf(a->payload + used, sizeof(a->payload) - used, "\t%u",
-                 intervals[a->model.interval]);
+                 ui_effective_cycle_gap(&a->model));
     else if(cmd == CmdAp || cmd == CmdApDetail)
         snprintf(a->payload + used, sizeof(a->payload) - used, "\t%lu",
                  (unsigned long)(cmd == CmdApDetail ? a->detail_slot
@@ -178,12 +181,12 @@ static bool export_store(App* a, SessionStore* store) {
     quiet_io(a, false);
     return ok;
 }
-static bool settings_fields(char** f, size_t n, unsigned* port, uint32_t* baud,
-                            unsigned* interval) {
+static bool settings_fields(char** f, size_t n, uint32_t* baud, unsigned* gap_ms) {
+    /* Accept the legacy port field (0/1), but always connect through USART. */
     uint32_t p, i;
-    if(n != 7 || strcmp(f[1], "0") || strcmp(f[2], "SETTINGS") || !fbr_u32(f[3], &p) || p > 1 ||
-       !fbr_u32(f[4], baud) || (*baud != 115200 && *baud != 460800 && *baud != 921600) ||
-       !fbr_u32(f[5], &i) || i >= COUNT_OF(intervals))
+    if(n != 7 || strcmp(f[1], "0") || (strcmp(f[2], "SETTINGS") && strcmp(f[2], "SETTINGS2")) ||
+       !fbr_u32(f[3], &p) || p > 1 || !fbr_u32(f[4], baud) ||
+       (*baud != 115200 && *baud != 460800 && *baud != 921600) || !fbr_u32(f[5], &i))
         return false;
     if(strcmp(f[6], "-")) {
         const char* prefix = SESSION_DIR "/session_";
@@ -191,15 +194,20 @@ static bool settings_fields(char** f, size_t n, unsigned* port, uint32_t* baud,
         for(const char* c = f[6] + strlen(prefix); *c; ++c)
             if((*c < '0' || *c > '9') && *c != '_') return false;
     }
-    *port = p;
-    *interval = i;
+    if(!strcmp(f[2], "SETTINGS")) {
+        if(i > 3) return false;
+        *gap_ms = 0; /* Migrate old interval presets to Continuous, preserving recovery data. */
+    } else {
+        if(i > 60000) return false;
+        *gap_ms = i;
+    }
     return true;
 }
 /* Append framed preferences. A torn update retains the previous valid pointer;
  * committed always comes from events.journal, never from this file. SDK rename
  * uses copy+remove, so it cannot safely publish a single recovery pointer. */
 typedef struct {
-    unsigned port, interval;
+    unsigned cycle_gap_ms;
     uint32_t baud;
     char path[STORE_PATH];
 } LocalSettings;
@@ -210,13 +218,12 @@ static bool settings_read(LocalSettings* local, File* file, uint32_t* good) {
     *good = 0;
     int result;
     while((result = store_next(file, r)) == 1) {
-        unsigned port, interval;
+        unsigned cycle_gap_ms;
         uint32_t baud;
         size_t n = fbr_decode(r->line.data, f);
-        if(!settings_fields(f, n, &port, &baud, &interval) || r->end > UINT32_MAX) break;
-        local->port = port;
+        if(!settings_fields(f, n, &baud, &cycle_gap_ms) || r->end > UINT32_MAX) break;
         local->baud = baud;
-        local->interval = interval;
+        local->cycle_gap_ms = cycle_gap_ms;
         const char* path = strcmp(f[6], "-") ? f[6] : "";
         memcpy(local->path, path, strlen(path) + 1);
         *good = r->end;
@@ -241,9 +248,8 @@ static bool save_settings(App* a) {
         if(ok) ok = storage_file_seek(f, good, true) && storage_file_truncate(f);
     }
     char data[STORE_PATH + 96], frame[STORE_PATH + 112];
-    snprintf(data, sizeof(data), "FBR1\t0\tSETTINGS\t%u\t%lu\t%u\t%s",
-             a->port == FuriHalSerialIdLpuart, (unsigned long)a->baud, a->model.interval,
-             *a->store.path ? a->store.path : "-");
+    snprintf(data, sizeof(data), "FBR1\t0\tSETTINGS2\t0\t%lu\t%u\t%s", (unsigned long)a->baud,
+             a->model.cycle_gap_ms, *a->store.path ? a->store.path : "-");
     size_t size = fbr_encode(data, frame, sizeof(frame));
     ok = ok && size && store_write(f, frame, size) && storage_file_sync(f);
     if(!storage_file_close(f)) ok = false;
@@ -259,9 +265,8 @@ static bool load_settings(App* a) {
         LocalSettings local = {0};
         ok = settings_read(&local, f, &good);
         if(ok && good) {
-            a->port = local.port ? FuriHalSerialIdLpuart : FuriHalSerialIdUsart;
             a->baud = a->model.baud = local.baud;
-            a->model.interval = local.interval;
+            a->model.cycle_gap_ms = local.cycle_gap_ms;
             strcpy(a->store.path, local.path);
         }
         if(!storage_file_close(f)) ok = false;
@@ -273,6 +278,7 @@ static void fail(App* a, const char* text) {
     a->failed = true;
     a->startup = false;
     a->model.ready = false;
+    a->model.start_confirmation_pending = false;
     message(a, text);
     store_log(a->storage, text);
 }
@@ -380,6 +386,10 @@ static void receive_observation(App* a, char** f, size_t n) {
         view->rssi = ap->rssi;
         view->channel = ap->channel;
         view->fix = ap->fix;
+        uint32_t reason;
+        fbr_u32(f[22], &reason);
+        view->rx_unverified = (reason & FBR_RX_UNVERIFIED) != 0;
+        view->reception_timing = !strcmp(a->model.firmware, "0.4.0");
         view->boot = ap->boot;
         view->sequence = ap->sequence;
         view->session = ap->scan;
@@ -396,6 +406,7 @@ static void recover(App* a) {
     a->failed = a->storage_failed = a->need_nack = false;
     a->startup = true;
     a->model.ready = false;
+    a->model.start_confirmation_pending = false;
     a->state_known = a->stop_confirmed = false;
     a->finishing = a->config_wait = false;
     a->last_status = ms();
@@ -456,6 +467,15 @@ static void finish_export(App* a) {
     a->state_known = false;
     command(a, CmdState);
     message(a, "Session archived; checking IDLE");
+}
+static void scan_metrics_unavailable(App* a) {
+    a->model.scan_metrics_known = false;
+    if(a->startup)
+        command(a, CmdState);
+    else if(a->finishing)
+        finish_export(a);
+    else
+        message(a, "Scan metrics unavailable");
 }
 static void state_received(App* a, char** f, bool response) {
     uint32_t boot;
@@ -524,6 +544,7 @@ static void status_received(App* a, char** f) {
     a->model.connected = true;
     a->model.running = !strcmp(f[4], "1");
     a->model.idle = !strcmp(f[5], "IDLE");
+    if(a->model.running || !a->model.idle) a->model.start_confirmation_pending = false;
     snprintf(a->model.phase, sizeof(a->model.phase), "%s", f[5]);
     fbr_u32(f[12], &a->model.truncated);
     fbr_u32(f[13], &a->model.discarded);
@@ -566,6 +587,8 @@ static void receive_line(App* a) {
             a->model.memory_known = false;
             a->model.storage_ready = a->model.ap_capacity > 0 && a->model.queue_capacity > 0;
             command(a, CmdState);
+        } else if(cmd == CmdScanMetrics && !strcmp(f[3], "UNKNOWN_COMMAND")) {
+            scan_metrics_unavailable(a);
         } else if(cmd == CmdSetConfig) {
             a->config_wait = false;
             /* Refresh authoritative configuration even after a rejected update. */
@@ -579,9 +602,11 @@ static void receive_line(App* a) {
         if(cmd == CmdHello) {
             uint32_t boot, value;
             if(n != 11 || strcmp(f[3], "HELLO") ||
-               (strcmp(f[4], "0.3.0") && strcmp(f[4], "0.2.0")) || !fbr_u32(f[5], &boot) ||
-               !fbr_u32(f[6], &value) || value != a->baud || strlen(f[7]) != 2 ||
-               !fbr_u32(f[8], &value) || strcmp(f[9], "2000") || strcmp(f[10], "3")) {
+               (strcmp(f[4], "0.4.0") && strcmp(f[4], "0.3.1") && strcmp(f[4], "0.3.0") &&
+                strcmp(f[4], "0.2.0")) ||
+               !fbr_u32(f[5], &boot) || !fbr_u32(f[6], &value) || value != a->baud ||
+               strlen(f[7]) != 2 || !fbr_u32(f[8], &value) || strcmp(f[9], "2000") ||
+               strcmp(f[10], "3")) {
                 a->pending = CmdNone;
                 fail(a, "Unsupported firmware / HELLO");
                 return;
@@ -589,6 +614,7 @@ static void receive_line(App* a) {
             a->pending = CmdNone;
             if(!check_boot(a, boot)) return;
             snprintf(a->model.firmware, sizeof(a->model.firmware), "%s", f[4]);
+            a->model.scan_metrics_known = a->model.capture_degraded = false;
             command(a, CmdInfo);
             return;
         }
@@ -664,6 +690,7 @@ static void receive_line(App* a) {
         if(!journal(a, a->raw)) return;
         a->model.rows = a->store.records = 0;
         a->model.ap_count = 0;
+        a->model.scan_metrics_known = false;
         a->table_view = a->model.network_loading = false;
         a->model.utc_start[0] = a->model.utc_stop[0] = 0;
         a->model.running = true;
@@ -686,7 +713,10 @@ static void receive_line(App* a) {
         return;
     }
     if(!strcmp(f[2], "ERROR") && !id && (n == 4 || n == 5)) {
-        if(!strcmp(f[3], "AP_TABLE_FULL")) {
+        if(!strcmp(f[3], "RADIO_CAPTURE_INIT")) {
+            a->model.capture_degraded = true;
+            message(a, "RADIO_CAPTURE_INIT: no located RX");
+        } else if(!strcmp(f[3], "AP_TABLE_FULL")) {
             a->closing = a->model.stopping = true;
             message(a, "AP table full; archiving session");
             if(a->pending == CmdNone) command(a, CmdStop);
@@ -736,7 +766,24 @@ static void receive_line(App* a) {
                                  a->model.memory[13] == a->model.queue_capacity &&
                                  a->model.ap_capacity >= 64 && a->model.queue_capacity >= 32;
         a->pending = CmdNone;
-        if(a->startup) command(a, CmdState);
+        if(a->startup)
+            command(a, ui_continuous_supported(a->model.firmware) ? CmdScanMetrics : CmdState);
+    } else if(!strcmp(f[2], "SCAN_METRICS") && cmd == CmdScanMetrics) {
+        uint32_t boot, session;
+        fbr_u32(f[3], &boot);
+        fbr_u32(f[4], &session);
+        if(boot != a->boot || (!a->startup && session != a->session)) return;
+        a->pending = CmdNone;
+        for(unsigned i = 0; i < FBR_SCAN_METRIC_FIELDS; ++i)
+            fbr_u64(f[i + 3], &a->model.scan_metrics[i]);
+        a->model.scan_metrics_known = true;
+        a->model.capture_degraded = !a->model.scan_metrics[MetricCaptureReady];
+        if(a->startup)
+            command(a, CmdState);
+        else {
+            if(a->store.open && !journal(a, a->raw)) return;
+            if(a->finishing) finish_export(a);
+        }
     } else if(!strcmp(f[2], "STATE") && cmd == CmdState) {
         a->pending = CmdNone;
         state_received(a, f, true);
@@ -776,6 +823,9 @@ static void receive_line(App* a) {
                         a->archive_stage = 3;
                         command(a, CmdStats);
                     }
+                } else if(ui_continuous_supported(a->model.firmware)) {
+                    a->archive_stage = 4;
+                    command(a, CmdScanMetrics);
                 } else
                     finish_export(a);
             }
@@ -801,11 +851,12 @@ static void receive_line(App* a) {
                      "%s\nChanges: %s\n"
                      "First ms: %s\nLast ms: %s\nFirst UTC: %s\nLast UTC: %s\n\n"
                      "Last fix: %s\nLat: %s / Lon: %s\nStrongest fix: %s\nLat: %s / Lon: %s\n\n"
-                     "Points sampled at scan end.\nNot the router location.",
+                     "%s\nNot the router location.",
                      *ssid ? ssid : "Hidden network", f[6], f[7], f[8], f[9], f[27], f[28], f[10],
                      f[11], f[12], f[13], f[14], f[15], f[18], f[16], f[17], f[25], f[26], f[19],
                      !strcmp(f[19], "1") ? f[20] : "-", !strcmp(f[19], "1") ? f[21] : "-", f[22],
-                     !strcmp(f[22], "1") ? f[23] : "-", !strcmp(f[22], "1") ? f[24] : "-");
+                     !strcmp(f[22], "1") ? f[23] : "-", !strcmp(f[22], "1") ? f[24] : "-",
+                     ui_observation_timing(a->model.firmware));
         } else if(a->finishing) {
             if(!journal(a, a->raw)) return;
             snprintf(a->model.message, sizeof(a->model.message), "Archiving AP %u / %u",
@@ -835,27 +886,27 @@ static void receive_line(App* a) {
         }
     }
 }
+static bool query_retryable(Command cmd) {
+    switch(cmd) {
+    case CmdHello:
+    case CmdPing:
+    case CmdInfo:
+    case CmdConfig:
+    case CmdMemory:
+    case CmdState:
+    case CmdStatus:
+    case CmdStats:
+    case CmdAp:
+    case CmdApDetail:
+    case CmdGps:
+    case CmdScanMetrics:
+        return true;
+    default:
+        return false;
+    }
+}
 static void service(App* a) {
     if(!a->serial) return;
-    if(a->pending != CmdNone && elapsed(a->sent_at, TIMEOUT_MS)) {
-        Command timed = a->pending;
-        a->pending = CmdNone;
-        if(timed == CmdHello && a->startup && a->baud_probe < 2) {
-            unsigned index = 0;
-            while(index < COUNT_OF(bauds) && bauds[index] != a->baud) ++index;
-            set_baud(a, bauds[(index + 1) % COUNT_OF(bauds)]);
-            ++a->baud_probe;
-            command(a, CmdHello);
-        } else if(timed == CmdStart || timed == CmdStop || timed == CmdSetConfig) {
-            /* No blind retry of commands without response caching. Query state first. */
-            a->start_uncertain = timed == CmdStart;
-            a->closing = a->model.stopping = true;
-            a->stop_confirmed = false;
-            command(a, CmdState);
-            message(a, "Command timeout; checking state");
-        } else
-            fail(a, "No response; Retry to recover");
-    }
     if(!a->failed && !a->startup && elapsed(a->last_status, 5000)) {
         fail(a, "Link unknown; Retry to recover");
         a->model.connected = false;
@@ -863,7 +914,40 @@ static void service(App* a) {
         store_close(&a->store);
         a->model.file_open = false;
         a->storage_failed = true;
+        /* Retire a stalled query so its retries cannot postpone the link probe. */
+        if(query_retryable(a->pending)) a->pending = CmdNone;
         if(a->pending == CmdNone) command(a, CmdPing);
+    }
+    if(a->pending != CmdNone && elapsed(a->sent_at, TIMEOUT_MS)) {
+        Command timed = a->pending;
+        if(!a->quit && query_retryable(timed) && a->retries < QUERY_RETRIES) {
+            /* A baud switch can lose the first reply. Retry queries at the same
+             * speed before probing another baud; never replay state changes. */
+            ++a->retries;
+            a->sent_at = ms();
+            transmit(a, a->payload);
+        } else {
+            a->pending = CmdNone;
+            if(a->quit && timed != CmdStop) {
+                /* Let the shutdown path send STOP within its bounded drain window. */
+            } else if(timed == CmdHello && a->startup && a->baud_probe < 2) {
+                unsigned index = 0;
+                while(index < COUNT_OF(bauds) && bauds[index] != a->baud) ++index;
+                set_baud(a, bauds[(index + 1) % COUNT_OF(bauds)]);
+                ++a->baud_probe;
+                command(a, CmdHello);
+            } else if(timed == CmdScanMetrics) {
+                scan_metrics_unavailable(a);
+            } else if(timed == CmdStart || timed == CmdStop || timed == CmdSetConfig) {
+                /* No blind retry of commands without response caching. Query state first. */
+                a->start_uncertain = timed == CmdStart;
+                a->closing = a->model.stopping = true;
+                a->stop_confirmed = false;
+                command(a, CmdState);
+                message(a, "Command timeout; checking state");
+            } else
+                fail(a, "No response; Retry to recover");
+        }
     }
     if(a->need_nack && a->pending == CmdNone)
         command(a, CmdNack);
@@ -935,7 +1019,22 @@ static void list_sessions(App* a, unsigned direction) {
 }
 static void handle_action(App* a, ActionRequest request) {
     Action action = request.type;
+    if(action == ActionCancelStart) {
+        if(a->model.start_confirmation_pending) {
+            a->model.start_confirmation_pending = false;
+            message(a, a->model.fix ? "Start cancelled. OK: start"
+                                    : "Start cancelled; waiting for GPS");
+        }
+        return;
+    }
+    if(action == ActionConfirmStart) {
+        if(!a->model.start_confirmation_pending) return;
+        a->model.start_confirmation_pending = false;
+        /* A stale or repeated confirmation must never toggle/stop another session. */
+        if(a->model.running || a->store.open) return;
+    }
     if(action == ActionQuit) {
+        a->model.start_confirmation_pending = false;
         a->quit = true;
         a->quit_at = ms();
         a->quit_stop_sent = false;
@@ -950,18 +1049,16 @@ static void handle_action(App* a, ActionRequest request) {
             return;
         }
         if(!a->serial) {
-#ifndef FBR_HOST_TEST
-            a->serial = furi_hal_serial_control_acquire(a->port);
+            a->serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
             if(!a->serial) {
-                message(a, "UART busy. Try another port");
+                message(a, "USART busy. Close other UART apps");
                 return;
             }
+#ifndef FBR_HOST_TEST
             furi_hal_serial_init(a->serial, a->baud);
             furi_hal_serial_configure_framing(a->serial, FuriHalSerialDataBits8,
                                               FuriHalSerialParityNone, FuriHalSerialStopBits1);
             furi_hal_serial_async_rx_start(a->serial, uart_rx, a, true);
-#else
-            a->serial = (void*)1;
 #endif
         }
         recover(a);
@@ -1049,9 +1146,8 @@ static void handle_action(App* a, ActionRequest request) {
         message(a, ok ? "CSV export complete" : "Export failed; journal retained");
         return;
     }
-    if(action == ActionInterval && request.value < COUNT_OF(intervals) && !a->model.running &&
-       !a->store.open) {
-        a->model.interval = request.value;
+    if(action == ActionCycleGap && request.value <= 60000 && !a->model.running && !a->store.open) {
+        a->model.cycle_gap_ms = request.value;
         if(!save_settings(a)) message(a, "Settings SD error");
         return;
     }
@@ -1076,12 +1172,18 @@ static void handle_action(App* a, ActionRequest request) {
         command(a, CmdApDetail);
         return;
     }
-    if(action == ActionToggle) {
+    if(action == ActionToggle || action == ActionConfirmStart) {
         if(a->model.running || a->store.open) {
             a->closing = a->model.stopping = true;
             a->stop_confirmed = false;
             command(a, CmdStop);
         } else if(!a->closing && a->model.idle && a->model.wifi && a->model.storage_ready) {
+            if(!a->model.fix && action != ActionConfirmStart) {
+                a->model.start_confirmation_pending = true;
+                message(a, "No GPS fix. Confirm Start or Cancel");
+                return;
+            }
+            a->model.start_confirmation_pending = false;
             /* Refresh STATE before START to persist the global sequence baseline. */
             if(open_file(a)) {
                 a->start_uncertain = true;
@@ -1091,7 +1193,12 @@ static void handle_action(App* a, ActionRequest request) {
         }
     } else if(action == ActionGps)
         command(a, CmdGps);
-    else if(action == ActionDiagnostics)
+    else if(action == ActionScanMetrics) {
+        if(ui_continuous_supported(a->model.firmware))
+            command(a, CmdScanMetrics);
+        else
+            message(a, "Scan metrics require firmware 0.4.0");
+    } else if(action == ActionDiagnostics)
         command(a, CmdMemory);
     else if(action == ActionPause && a->model.running)
         command(a, a->model.paused ? CmdResume : CmdPause);

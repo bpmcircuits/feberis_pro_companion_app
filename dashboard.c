@@ -39,8 +39,8 @@ void dashboard_draw(Canvas* c, void* context) {
     canvas_draw_line(c, 4, 14, 123, 14);
     if(state == UiOffline) {
         canvas_draw_str(c, 4, 28, "Feberis WiFi wardriver");
-        canvas_draw_str(c, 4, 40, s->port ? "UART: LPUART" : "UART: USART");
-        canvas_draw_str(c, 4, 50, "Choose UART in Menu");
+        canvas_draw_str(c, 4, 40, "UART: USART");
+        canvas_draw_str(c, 4, 50, "Press OK to connect");
     } else if(state == UiError || state == UiNoWifi || state == UiNoMemory) {
         canvas_draw_str(c, 4, 27,
                         (state == UiNoWifi || state == UiNoMemory) ? "Cannot start a scan"
@@ -59,7 +59,9 @@ void dashboard_draw(Canvas* c, void* context) {
         stat(c, 4, m->unique, "Unique AP");
         stat(c, 68, m->rows, "SD saved");
         char gps[48];
-        if(m->fix)
+        if(m->capture_degraded)
+            snprintf(gps, sizeof(gps), "Capture off; see diagnostics");
+        else if(m->fix)
             snprintf(gps, sizeof(gps), "GPS fix  %lu sat  H:%.5s", (unsigned long)m->satellites,
                      m->hdop);
         else

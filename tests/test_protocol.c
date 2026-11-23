@@ -92,6 +92,35 @@ int main(void) {
     assert(strstr(out, ",0,0,,,WIFI\n"));
     f[8] = "[UNKNOWN][ESS]";
     assert(!fbr_wigle(f, out, sizeof(out)));
+    f[8] = "[ESS]";
+    f[11] = "0";
+    f[13] = f[14] = "nan";
+    f[22] = "129";
+    assert(fbr_observation(f, n, &ap) && !fbr_wigle(f, out, sizeof(out)));
+    f[22] = "4294967295";
+    assert(fbr_observation(f, n, &ap));
+    f[22] = "4294967296";
+    assert(!fbr_observation(f, n, &ap));
+    f[22] = "129";
+    f[11] = "1";
+    f[13] = f[14] = "0";
+    assert(!fbr_observation(f, n, &ap) && !fbr_wigle(f, out, sizeof(out)));
+    f[22] = "257";
+    assert(fbr_observation(f, n, &ap) && fbr_wigle(f, out, sizeof(out)));
+    n = decode("FBR1\t1\tSCAN_"
+               "METRICS\t7\t1\t0\t120\t1\t4000\t20\t20\t25\t4020\t1000\t18446744073709551615\t3\t4"
+               "\t5\t6\t7\t8\t9\t32768\t65536\t4096\t512",
+               frame, f);
+    assert(n == 26 && fbr_validate(f, n));
+    assert(!fbr_validate(f, n - 1));
+    f[7] = "2";
+    assert(!fbr_validate(f, n));
+    f[7] = "1";
+    f[5] = "60001";
+    assert(!fbr_validate(f, n));
+    f[5] = "0";
+    f[25] = "1025";
+    assert(!fbr_validate(f, n));
     n = decode("FBR1\t1\tSTATE\t7\t1\t0\t0\t0\t0\t0\t20\t19\t12345678901", frame, f);
     assert(n == 13 && fbr_validate(f, n));
     n = decode("FBR1\t1\tGPS\t0\t-\tnan\tnan\tnan\tnan\t0\t4294967295\tnan\tnan\tnan", frame, f);

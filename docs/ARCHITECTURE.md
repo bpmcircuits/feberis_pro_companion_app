@@ -18,6 +18,7 @@ not independent compilation units.
 
 ## Concurrency and bounded memory
 
+The connection always acquires `FuriHalSerialIdUsart`; the port is fixed in code.
 The UART callback copies received bytes into a **4096-byte stream buffer** and
 reports UART errors. It does not parse frames, write SD, or update native views.
 The worker parses input, validates records, executes commands, writes the journal,
@@ -47,14 +48,25 @@ Commands use nonzero request IDs and one tracked request at a time. Replies must
 match the pending request; asynchronous events use ID zero. START, STOP, and
 SET_CONFIG are not blindly replayed after timeout because the ESP does not cache
 responses by request ID. The application queries state before resolving an
-uncertain operation. HELLO negotiation can probe alternate baud rates.
+uncertain operation. HELLO, PING, and read-only queries are retried at most twice
+with the same ID before failing or, for HELLO, probing another baud rate. Retrying
+the current speed first handles the bridge losing an initial reply after a baud
+switch. Shutdown skips query retries so they cannot delay its STOP attempt.
 
 Connection reads HELLO 2, INFO, CONFIG, MEMORY, and STATE. GET_MEMORY's
 UNKNOWN_COMMAND response is accepted only for firmware 0.2.0, which falls back to
-GET_INFO capacities. Firmware 0.3.0 requires usable, matching memory limits before
+GET_INFO capacities. Firmware 0.3.0/0.3.1/0.4.0 require usable, matching memory limits before
 Start is enabled.
 
-A new session directory and journal are opened before START_SCAN. The journal
+A Start request is checked against the worker's current fix. Without a fix, it
+sets a transient confirmation request for the GUI and does not create a file or
+send START_SCAN. Cancel clears the request; confirmation is consumed once and
+rechecks connection/session readiness. Errors, reconnect, and exit invalidate it.
+This allows a stale GUI snapshot to prompt rather than silently start without GPS,
+and prevents an old confirmation from toggling an already running session.
+
+A new session directory and journal are opened before START_SCAN, after any required
+no-GPS confirmation. The journal
 records the global sequence baseline from STATE and a START_INTENT for the next
 session number. SESSION_STARTED binds the live session. This allows recovery when
 an application restart occurs between sending START and receiving its response.
@@ -108,8 +120,13 @@ incomplete because filtered detections are not present in the observation stream
 
 ## Preferences and the active-session pointer
 
-`config/settings.conf` is an append-only sequence of CRC-protected SETTINGS
-records containing local UART choice, baud, interval, and the active journal path.
+`config/settings.conf` is an append-only sequence of CRC-protected SETTINGS2
+records containing a reserved legacy port field, baud, cycle gap in milliseconds,
+and the active journal path. USART is fixed; the port field is always written as
+zero. The reader also accepts legacy SETTINGS records: it preserves baud and the
+recovery path while migrating the former interval index to Continuous (0 ms).
+This avoids accidentally retaining an old default 2000 ms delay in driving mode.
+For legacy firmware, the effective START argument is clamped to its 1000 ms minimum.
 A torn update leaves the previous valid record readable; the next write removes
 the invalid tail before appending. The path locates a journal, while committed is
 always recovered from that journal.
@@ -133,15 +150,40 @@ is interrupted.
   a complete final table, only the header is exported.
 - `wigle.csv`: generated from validated observation fields rather than trusting
   `csv_hex`; only valid fix + UTC + finite WGS84 coordinates are eligible.
-- `stats.json`: named session statistics serialized directly as integers.
+- `stats.json`: named session statistics serialized directly as integers; optional
+  capture/scan metrics are a separate nested `scan_metrics` object.
 - `metadata.json`: schema/protocol versions, firmware, configuration array, boot,
   session, `journal_committed`, record count, actual capacities, interruption and
   aggregate-completion flags, first/last observation UTC, local finish time,
-  termination reason, and loss/statistics counters when available.
+  termination reason, loss/statistics counters, RX_UNVERIFIED record count, and
+  optional capture/scan metrics when available. `position_timestamp` preserves
+  `scan_end` for older firmware and reports
+  `reception_callback_or_scan_end_unverified` for 0.4.0. The per-record reason mask
+  identifies unverified fallback timestamps.
 
 The metadata's `journal_committed` represents durable local data. The `committed`
 statistic is the ESP's reported acknowledgement state. Local RTC names and local
 finish time are never presented as GPS UTC.
+
+## Continuous acquisition and provenance in 0.4.0
+
+The default START argument is zero extra post-batch delay. Local driving presets
+are 0/50/100/250 ms; long gaps are confined to diagnostic settings. The ESP handles
+its scan slices, capture cache, and queue backpressure independently. The FAP
+continues to ACK only synchronized observations, including unverified ones.
+
+Reason masks are parsed as uint32 so future bits do not reject otherwise supported
+records. RX_UNVERIFIED is a known provenance flag: its record must have no valid
+position and no prepared CSV. It never receives dashboard GPS coordinates and
+never enters WiGLE export. Original SSID bytes, including embedded NUL, remain
+in the raw journal and SSID hex exports.
+
+GET_SCAN_METRICS is an optional, bounded query. It runs during 0.4.0 connection,
+on demand in diagnostics, and before final export. Unsupported/timeout replies
+fall back without requiring the extension for basic recording. Accepted metric
+snapshots are journaled when a session is open, recovered like other CRC frames,
+and exported separately from observation-loss statistics. RADIO_CAPTURE_INIT sets
+a persistent degraded-capture indicator without stopping SDK scanning.
 
 ## Verification
 

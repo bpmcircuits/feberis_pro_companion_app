@@ -1,7 +1,7 @@
 # FBR1 revision 2 integration reference
 
-This document describes the protocol consumed by companion application 0.3 for
-Feberis Pro firmware 0.3.0. The authoritative firmware contract is
+This document describes the protocol consumed by companion application 0.4 for
+Feberis Pro firmware 0.4.0. The authoritative firmware contract is
 [FLIPPER_INTEGRATION.md in the firmware project](https://github.com/bpmcircuits/feberis_pro_wardriver/blob/HEAD/docs/FLIPPER_INTEGRATION.md).
 The companion always negotiates revision 2; it does not mix legacy AP delivery
 with OBSERVATION delivery during a session.
@@ -9,7 +9,8 @@ with OBSERVATION delivery during a session.
 ## Transport and framing
 
 UART: 8N1, 3.3 V, no flow control. Supported baud rates are 115200, 460800, and
-921600; the two higher rates require hardware verification.
+921600. The upstream 0.3.1 firmware test verified all three using a PC receiver;
+the companion FAP and its wiring still require physical testing.
 
 ```text
 FBR1<TAB>id<TAB>type<TAB>field...*HHHH<LF>
@@ -43,13 +44,14 @@ represent TAB-separated wire fields.
 | `HELLO 2` | `OK HELLO version boot baud country max_scan_records ack_ms retries` |
 | `GET_INFO` | `INFO version boot baud country ap_capacity queue_capacity revision` |
 | `GET_CONFIG` | `CONFIG` followed by 13 configuration fields |
+| `GET_SCAN_METRICS` | Optional 26-field SCAN_METRICS reply, described below |
 | `GET_MEMORY` | `MEMORY` followed by the 15 fields below |
 | `GET_STATUS` | `STATE boot session running paused scanning link_wait queued last_sequence committed elapsed_ms` |
 | `STATUS` | The 24-field compatibility status frame |
 | `GET_GPS` | `GPS valid utc lat lon altitude_m hdop satellites age_ms speed_kmh course_deg horizontal_accuracy_m` |
 | `GET_STATS` | Current-session STATS |
 | `GET_AP slot` | AP_DISCOVERED or AP_UPDATED for an occupied slot; `OK EMPTY` otherwise |
-| `START_SCAN interval_ms` | `OK START`; interval 1000–60000 ms |
+| `START_SCAN [gap_ms]` | `OK START`; extra post-batch delay 0–60000 ms, default 0 |
 | `STOP_SCAN` | `OK STOP`; stop future scans and preserve accepted queued records |
 | `PAUSE_SCAN` | `OK PAUSE_SCAN`; complete/process the current batch and block future scans |
 | `RESUME_SCAN` | `OK RESUME_SCAN`; continue the same running session |
@@ -64,7 +66,7 @@ Firmware additionally provides compatibility aliases and operations such as
 corresponding companion UI action. See the upstream contract for those operations.
 
 HELLO's response retains its compatible layout. INFO must report revision 2.
-The companion accepts firmware versions 0.3.0 and 0.2.0. Only firmware 0.2.0 may
+The companion accepts firmware versions 0.4.0, 0.3.1, 0.3.0, and 0.2.0. Only firmware 0.2.0 may
 return UNKNOWN_COMMAND for GET_MEMORY; the companion then uses INFO capacities
 and reports that extended diagnostics are unavailable.
 
@@ -95,7 +97,11 @@ SET_CONFIG, reads CONFIG back, then resumes only if it was not already paused.
 Changing baud requires a stopped session and empty queue. The ESP replies at the
 old baud, waits for transmit completion, and switches. The companion switches
 after receiving the complete OK and sends HELLO 2 again. If the OK is lost, recovery
-probes all supported rates. The configured baud survives ESP restart through NVS.
+retries HELLO at the current speed before probing alternatives. HELLO/PING and
+read-only GET/STATUS queries have at most two retries with the same request ID.
+START, STOP, SET_CONFIG, and other state-changing operations are not automatically
+replayed. This covers a first reply lost while the serial bridge settles, without
+applying SET_CONFIG again. The configured baud survives ESP restart through NVS.
 
 ## Memory diagnostics
 
@@ -109,7 +115,7 @@ ap_record_bytes ap_capacity ap_count queue_capacity queued
 ```
 
 Use actual capacities from INFO/MEMORY rather than assuming a fixed AP or queue
-limit. For firmware 0.3.0, the companion requires storage readiness and usable,
+limit. For firmware 0.3.0/0.3.1/0.4.0, the companion requires storage readiness and usable,
 consistent limits before Start. SRAM and PSRAM values remain separate; total heap
 statistics are not substitutes for these diagnostics. NVS and flash capacity do
 not make queued PSRAM observations persistent after power loss.
@@ -134,13 +140,23 @@ and does not wrap within a boot; monotonic time is uint64. Optional numeric valu
 may be `nan`; a valid position requires finite in-range coordinates.
 
 Reason bits: 1 FIRST, 2 DISTANCE, 4 RSSI, 8 INTERVAL, 16 METADATA,
-32 GPS_RECOVERED, 64 FULL_SAMPLE. PHY bits: bit 0 11b, bit 1 11g, bit 2 11n,
+32 GPS_RECOVERED, 64 FULL_SAMPLE. Bit 128 RX_UNVERIFIED is provenance, not a write
+trigger. Unknown reason bits are retained as uint32 and do not reject otherwise
+supported observations. PHY bits: bit 0 11b, bit 1 11g, bit 2 11n,
 bit 3 11a, bit 4 11ac, bit 5 11ax.
 
 No fix means missing coordinates, not 0,0. Fresh UTC can exist without valid
-geolocation. Position/time are sampled at scan completion and remain unchanged
-on retransmission. RMC/GGA currently reports no measured horizontal accuracy;
-HDOP is never converted to meters.
+geolocation. In 0.4.0, verified position/RSSI/time come from the strongest captured
+beacon/probe response, its software receive-callback timestamp, and the latest
+historical GNSS snapshot available no later than reception. Receiver/sample-rate
+uncertainty still applies. No later fix is substituted on retry.
+
+RX_UNVERIFIED means no matching reception metadata: fix_valid=0, latitude/longitude
+are `nan`, csv_hex is `-`, and monotonic time falls back to scan completion. Retain
+it in the journal and exclude it from WiGLE. Legacy firmware uses scan-end position
+timestamps. RMC/GGA currently reports no measured horizontal accuracy;
+HDOP is never converted to meters. Missing RMC speed/course is `nan`, not a
+measured zero; the GUI shows it as unavailable and observation CSV fields are empty.
 
 The companion preserves the raw frame in the journal and generates CSV from the
 validated observation fields. It does not use `csv_hex` as its exported WiGLE row.
@@ -222,3 +238,86 @@ For recovery, scan and repair the journal first, then negotiate HELLO, query STA
 and reconcile committed with RESUME_LINK. Do not deduplicate by BSSID or infer a
 new-session baseline of zero. A different boot cannot restore lost ESP RAM and
 must not automatically start a replacement recording session.
+
+## Firmware 0.3.1 compatibility changes
+
+Revision 2 framing and the OBSERVATION, STATUS, STATS, STATE, CONFIG, AP, and MEMORY
+layouts remain unchanged. The companion's compatibility update includes:
+
+- Accept version 0.3.1 during HELLO while retaining 0.3.0/0.2.0 support.
+- Export the exact WiGLE metadata below, including **brand=Sapsan**.
+- Retry bounded idempotent queries after baud changes; never blindly replay mutations.
+- Preserve missing speed/course as unavailable rather than displaying measured zero.
+
+```csv
+WigleWifi-1.4,appRelease=0.3.1,model=Feberis Pro,release=0.3.1,device=ESP32-C5,display=Flipper Zero,board=Feberis Pro,brand=Sapsan
+MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
+```
+
+The firmware now accepts RESUME_LINK only for its already committed sequence or
+an actually transmitted queue head. The companion continues to derive this value
+from its durable journal; a rejected checkpoint leaves that journal intact.
+The ESP's `rows` counter is based on actual prepared CSV, while the companion's
+SD saved count remains its durable observation count, including no-GPS records.
+
+SCAN_TIMEOUT can occur after PAUSE/STOP. If STATE still reports scanning=1, the
+companion continues waiting and keeps the journal open. Only driver completion
+(or explicit ESP restart and interrupted-session recovery) can unblock a new scan.
+The NMEA parsing and strongest-location fixes are implemented in the firmware;
+they do not require a new frame layout or reconstructing positions in the FAP.
+
+## Continuous driving and metrics in 0.4.0
+
+The companion sends `START_SCAN 0` by default. Optional explicit gap values are
+0–60000 ms. Its driving settings show **Cycle gap** with Continuous (0 ms), 50,
+100, or 250 ms. Longer gaps are in diagnostic settings. The argument is deliberate
+delay after batch processing, not a start-to-start period. Radio sweeps still take
+seconds at passive dwell 120 ms. SMART min_gap_ms and FULL full_gap_ms limit repeat
+observations per BSSID rather than scan starts.
+
+Legacy 0.2.0/0.3.x remains supported with its 1000 ms minimum and legacy gap presets.
+INFO's capacities are authoritative; the 0.4.0 SDK results buffer defaults to 512
+(build range 16–1024), so the companion does not assume the old 128-result limit.
+Accepted observations remain subject to durable ACK even under queue pressure.
+
+GET_SCAN_METRICS returns exactly 26 fields:
+
+```text
+FBR1 id SCAN_METRICS boot session requested_gap_ms dwell_ms capture_ready
+radio_ms ingest_ms gap_ms max_gap_ms period_ms ingest_cpu_us
+captured dropped malformed cache_overflows metadata_hits metadata_misses
+queue_high_water backpressure_ms scan_buffer_bytes capture_cache_bytes
+main_stack_free scan_capacity
+```
+
+Timing/size/high-water fields are uint32; ingest_cpu_us, capture counters,
+metadata_hits/misses, and backpressure_ms are uint64. The reply is validated for
+field count, numeric range, boot, and session. It is optional for basic operation.
+
+- radio_ms and ingest_ms describe the last completed batch; ingest_ms includes
+  waiting/scheduling while ingest_cpu_us accumulates actual slice wall time.
+- gap_ms is scan completion to next start, including processing, requested delay,
+  and queue pressure. period_ms is consecutive start-to-start time. Adjacent-cycle
+  values may be mixed while scanning; the first cycle may report zeros. Pause
+  resets the timing anchor.
+- captured/dropped/malformed/cache_overflows count reception metadata and its
+  queue/cache losses. They are separate from accepted-observation loss counters.
+- metadata_hits/misses count SDK results with/without matched reception metadata.
+- queue_high_water is the maximum accepted-observation queue awaiting durable ACK;
+  backpressure_ms counts completed intervals spent with that queue full.
+- scan_buffer_bytes and capture_cache_bytes are additional fixed PSRAM buffers.
+  GET_MEMORY.storage_reserved retains its previous three-buffer meaning.
+- main_stack_free is the ESP-IDF stack high-water value in bytes. Counts/high-water
+  values reset with a new session.
+
+RADIO_CAPTURE_INIT explicitly reports degraded capture. SDK scanning can continue,
+but unmatched observations are unlocalized. The FAP shows the degraded state and
+exports metrics as a separate object without combining capture loss and SD/queue
+loss counters.
+
+Current WiGLE metadata is exactly:
+
+```csv
+WigleWifi-1.4,appRelease=0.4.0,model=Feberis Pro,release=0.4.0,device=ESP32-C5,display=Flipper Zero,board=Feberis Pro,brand=Sapsan
+MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
+```
