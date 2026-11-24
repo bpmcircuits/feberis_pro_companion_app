@@ -321,3 +321,13 @@ Current WiGLE metadata is exactly:
 WigleWifi-1.4,appRelease=0.4.0,model=Feberis Pro,release=0.4.0,device=ESP32-C5,display=Flipper Zero,board=Feberis Pro,brand=Sapsan
 MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
 ```
+
+## WiGLE SSID encoding correction
+
+The WiGLE exporter preserves canonical UTF-8, doubles CSV quotes, and escapes
+invalid UTF-8 bytes, ASCII controls, DEL, and backslash as `\xNN`. Empty and
+all-NUL SSIDs export as empty names; other embedded NUL bytes remain `\x00`.
+Journal and hex exports preserve the original bytes. GUI display escaping is
+independent. Auth labels from firmware, including WAPI, DPP, and Enterprise
+variants, are preserved; UNKNOWN and RX_UNVERIFIED observations remain excluded.
+Existing UNKNOWN observations cannot be classified without new evidence.

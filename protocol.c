@@ -383,13 +383,57 @@ static size_t csv_fields(const char** fields, unsigned count, unsigned quoted, c
     out[used - 1] = '\n';
     return used;
 }
+/* CSV text keeps canonical UTF-8; display escaping remains independent. */
+static size_t ssid_utf8_length(const uint8_t* s, size_t remaining) {
+    uint8_t c = s[0];
+    size_t length = c >= 0xc2 && c <= 0xdf   ? 2
+                    : c >= 0xe0 && c <= 0xef ? 3
+                    : c >= 0xf0 && c <= 0xf4 ? 4
+                                             : 0;
+    if(!length || remaining < length) return 0;
+    for(size_t i = 1; i < length; ++i)
+        if(s[i] < 0x80 || s[i] > 0xbf) return 0;
+    if((c == 0xe0 && s[1] < 0xa0) || (c == 0xed && s[1] >= 0xa0) || (c == 0xf0 && s[1] < 0x90) ||
+       (c == 0xf4 && s[1] >= 0x90))
+        return 0;
+    return length;
+}
+static bool wigle_ssid(const char* encoded, char out[129]) {
+    size_t hex_length = strlen(encoded);
+    if(hex_length > 64 || hex_length % 2) return false;
+    uint8_t bytes[32];
+    size_t length = hex_length / 2, used = 0;
+    bool hidden = true;
+    for(size_t i = 0; i < length; ++i) {
+        int hi = hex(encoded[2 * i]), lo = hex(encoded[2 * i + 1]);
+        if(hi < 0 || lo < 0) return false;
+        bytes[i] = hi * 16 + lo;
+        if(bytes[i]) hidden = false;
+    }
+    for(size_t i = 0; !hidden && i < length; ++i) {
+        uint8_t c = bytes[i];
+        size_t sequence = ssid_utf8_length(bytes + i, length - i);
+        if(c >= 32 && c < 127 && c != '\\') {
+            out[used++] = c;
+        } else if(sequence) {
+            memcpy(out + used, bytes + i, sequence);
+            used += sequence;
+            i += sequence - 1;
+        } else {
+            snprintf(out + used, 129 - used, "\\x%02X", c);
+            used += 4;
+        }
+    }
+    out[used] = 0;
+    return true;
+}
 size_t fbr_wigle(char** f, char* out, size_t cap) {
     uint32_t reason;
     if(!fbr_u32(f[22], &reason) || (reason & FBR_RX_UNVERIFIED) || strcmp(f[11], "1") ||
        !strcmp(f[12], "-") || strstr(f[8], "UNKNOWN"))
         return 0;
     char ssid[129];
-    if(!fbr_ssid(f[7], ssid, sizeof(ssid))) return 0;
+    if(!wigle_ssid(f[7], ssid)) return 0;
     const char* cols[] = {f[6],
                           ssid,
                           f[8],

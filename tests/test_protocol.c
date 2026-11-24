@@ -90,6 +90,34 @@ int main(void) {
     assert(fbr_observation(f, n, &ap));
     assert(fbr_wigle(f, out, sizeof(out)) && strstr(out, "\"\\x00A\"\"\\x5C\\xFF\""));
     assert(strstr(out, ",0,0,,,WIFI\n"));
+    const char* original_ssid = f[7];
+    const struct {
+        const char* hex;
+        const char* csv;
+    } names[] = {
+        {"C581C3B364C5BA2C22E7BD91F09F93A122", "Łódź,\"\"网📡\"\""},
+        {"", ""},
+        {"0000000000000000000000000000000000000000000000000000000000000000", ""},
+        {"410042", "A\\x00B"},
+        {"C0AFEDA080F4908080E282", "\\xC0\\xAF\\xED\\xA0\\x80\\xF4\\x90\\x80\\x80\\xE2\\x82"},
+        {"C222E20AAC", "\\xC2\"\"\\xE2\\x0A\\xAC"},
+    };
+    for(size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        f[7] = (char*)names[i].hex;
+        size_t length = fbr_wigle(f, out, sizeof(out));
+        assert(length);
+        char expected[256];
+        snprintf(expected, sizeof(expected), ",\"%s\",", names[i].csv);
+        assert(strstr(out, expected));
+        assert(!strcmp(f[7], names[i].hex));
+        assert(!fbr_wigle(f, out, length));
+        assert(fbr_wigle(f, out, length + 2) == length);
+    }
+    f[7] = "GG";
+    assert(!fbr_wigle(f, out, sizeof(out)));
+    f[7] = "0";
+    assert(!fbr_wigle(f, out, sizeof(out)));
+    f[7] = (char*)original_ssid;
     f[8] = "[UNKNOWN][ESS]";
     assert(!fbr_wigle(f, out, sizeof(out)));
     f[8] = "[ESS]";
